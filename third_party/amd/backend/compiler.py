@@ -134,7 +134,9 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
-        if options.num_stages == 0 and amd.has_matrix_core_feature(options.arch):
+        if options.num_stages > 2:
+            raise Exception("num_stages > 2 is not supported")
+        if (options.num_stages == 0 or options.num_stages == 2 ) and amd.has_matrix_core_feature(options.arch):
             amd.passes.ttgpuir.add_stream_pipeline(pm)
             passes.common.add_canonicalizer(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
