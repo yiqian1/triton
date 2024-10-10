@@ -373,6 +373,7 @@ public:
     unsigned oldResIdx = 0, newResIdx = 0;
     while (oldResIdx < results.size()) {
       if (!triton::isTensorPointerType(results[oldResIdx].getType())) {
+        results[oldResIdx].replaceAllUsesWith(newOp.getResult(newResIdx));
         oldResIdx++;
         newResIdx++;
       } else {
