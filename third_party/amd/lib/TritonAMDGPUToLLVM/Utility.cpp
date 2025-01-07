@@ -358,4 +358,69 @@ void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
   LLVM::createLLVMCallOp(rewriter, loc, funcOp, ValueRange({ptr, val, pred}));
 }
 
-} // namespace mlir::LLVM::AMD
+//   gfx940: bit 0 = sc0, bit 1 = nt, bit 3 = swz, bit 4 = sc1
+// MI300 Vector Memory instructions (Flat, Global, Scratch, and Buffer) have 3
+// bits to control scope and cacheability:
+// - SC[1:0] System Cache level: 0=wave, 1=group, 2=device, 3=system
+// - NT Non-Temporal: 0=expect temporal reuse; 1=do not expect temporal reuse
+//
+// Op   | cm  | SC1 | SC0 | NT |
+// -----+-----+-----+-----+----+--
+// Load | .ca |  0  |  0  | 0  |
+//      | .cg |  0  |  x  | 1  |
+//      | .cs |  1  |  0  | x  |
+//      | .cv |  1  |  1  | 1  |
+// -----+-----+-----+-----+----+--
+// Store| .wb |  1  |  0  | 0  |
+//      | .cg |  0  |  0  | 0  |
+//      | .cs |  1  |  0  | 1  |
+//      | .wt |  1  |  1  | x  |
+static int32_t getCacheModifierForCDNA3(triton::CacheModifier cm, bool isBufferLoad) {
+  const int sc0Bit = 0b1, ntBit = 0b10, sc1Bit = 0b1000;
+  int32_t aux = 0;
+
+  switch (cm) {
+  case triton::CacheModifier::CA:
+    aux = 0;
+    break;
+  case triton::CacheModifier::CG:
+    if (isBufferLoad)
+      aux |= ntBit;
+    break;
+  case triton::CacheModifier::CS:
+    aux |= sc1Bit;
+    if (!isBufferLoad)
+      aux |= ntBit;
+    break;
+  case triton::CacheModifier::CV:
+    aux |= sc0Bit | sc0Bit | ntBit;
+    break;
+  case triton::CacheModifier::WB:
+    aux |= sc1Bit;
+    break;
+  case triton::CacheModifier::WT:
+    aux |= sc1Bit | sc0Bit;
+    break;
+  default:
+    aux = 0;
+  }
+  return aux;
+}
+
+static int32_t getDefaultCacheModifier(triton::CacheModifier cm) { return 0; }
+
+// Cache modifiers changes how data is managed in the GPU's cache hierarchy:
+// .ca: cache all, keeps data in all cache levels with normal eviction policy
+// .cg: cache global, bypasses L1 and keeps data in L2 and below
+// .cs: cache streaming, keeps data in L1 and L2 with the evict-first policy
+// .cv: cache volatile, no caching at all
+// .wb: write-back, writes back data at all cache levels
+// .wt: write-through, write data directly to system memory
+int32_t getCacheModifierForTarget(triton::CacheModifier cm, bool isBufferLoad,
+                                  mlir::triton::AMD::TargetInfo targetInfo) {
+  if (targetInfo.getISAFamily() == ISAFamily::CDNA3) // gfx942, gfx941, gfx940
+    return getCacheModifierForCDNA3(cm, isBufferLoad);
+  else
+    return getDefaultCacheModifier(cm);
+}
+}// namespace mlir::LLVM::AMD
