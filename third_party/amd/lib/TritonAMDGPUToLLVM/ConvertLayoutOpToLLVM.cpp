@@ -93,6 +93,7 @@ public:
 
       Value resVec0, resVec1;
       if (mfmaLayout.getMDim() == 32) {
+llvm::errs()<<"convertLayout 32\n";
         /*
         Using wave shuffle to convert layouts (32x32x16 case):
         1) Input MMA layout (32x32, fp8, 16 values):
@@ -122,6 +123,7 @@ public:
         resVec0 = b.select(mask0, vec0, shflVec1);
         resVec1 = b.select(mask0, shflVec0, vec1);
       } else if (mfmaLayout.getMDim() == 16) {
+llvm::errs()<<"convertLayout 16\n";
         /*
         16x16x32 case:
         1) Input MMA layout (two 16x16, fp8, 4 values each):

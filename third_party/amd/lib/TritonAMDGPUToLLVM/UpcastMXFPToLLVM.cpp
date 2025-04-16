@@ -294,7 +294,7 @@ public:
     // for the current thread starts at ((tid % mDim) * (64 / mDim)).
     Value offset =
         b.mul(b.urem(laneId, b.i32_val(mDim)), b.i32_val(numThreads / mDim));
-
+llvm::errs()<<" UpcastMXFPOp\n";
     if (mDim == 32) {
       // One mfma32 intrinsic processes a 32x8 A tensor slice. Due to how we
       // tile, the same warp owns the whole K dim. Inside a warp, each thread

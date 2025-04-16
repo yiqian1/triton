@@ -26,6 +26,8 @@ public:
   LogicalResult
   matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+llvm::errs()<<"\nReduceOp\n";
+op.dump();
     ReduceOpHelper helper(op);
     assert(helper.isReduceWithinCTA() &&
            "Unexpected srcLayout in ReduceOpConversion");
@@ -160,7 +162,7 @@ private:
                                          numLaneToReduce, interleave);
     if (success)
       return;
-
+llvm::errs()<<" warpReduce\n";
     for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {
       SmallVector<Value> shfl(acc.size());
       for (unsigned i = 0; i < acc.size(); ++i) {

@@ -158,21 +158,25 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
 Value TargetInfo::shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                              int i) const {
+llvm::errs()<<"TargetInfo::shuffleXor\n";
   return LLVM::AMD::shuffleXor(loc, rewriter, val, i, getISAFamily());
 }
 
 Value TargetInfo::shuffleUp(RewriterBase &rewriter, Location loc, Value val,
                             int i) const {
+llvm::errs()<<"TargetInfo::shuffleUp\n";
   return LLVM::AMD::shuffleUp(loc, rewriter, val, i, getISAFamily());
 }
 
 Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
                              int i) const {
+llvm::errs()<<"TargetInfo::shuffleI\n";
   return LLVM::AMD::shuffleIdx(loc, rewriter, val, i, getISAFamily());
 }
 
 Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
                              Value i) const {
+llvm::errs()<<"TargetInfo::shuffleIdx\n";
   return LLVM::AMD::shuffleIdx(loc, rewriter, val, i, getISAFamily());
 }
 

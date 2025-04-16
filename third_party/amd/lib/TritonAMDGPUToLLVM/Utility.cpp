@@ -119,14 +119,15 @@ static Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
   auto mod = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
   Value threadId = getThreadId(rewriter, loc);
 
-  unsigned iWarpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
-  Value warpSize = b.i32_val(iWarpSize);
-  Value laneId = b.urem(threadId, warpSize);
+  //unsigned iWarpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+  //Value warpSize = b.i32_val(iWarpSize);
+  //Value laneId = b.urem(threadId, warpSize);
   auto bpermute = [&](Value lane) {
     // Multiple lineId by 4. (More on permute instruction semantics:
     // https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/instinct-mi200-cdna2-instruction-set-architecture.pdf#page=180
     Value byteOffset = b.i32_val(2);
     Value permuteAddr = b.shl(lane, byteOffset);
+//llvm::errs()<<"\nbpermute\n";
     return rewriter.create<ROCDL::DsBpermuteOp>(loc, valType, permuteAddr, val);
   };
 
@@ -135,6 +136,7 @@ static Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
     if (strideInt > 16) {
       Value stride = b.i32_val(32);
       Value lineId = b.xor_(threadId, stride);
+llvm::errs()<<"\nShflKind::bfly\n";
       return bpermute(lineId);
     } else if (strideInt == 16) {
       Value offset = b.i32_val(0x401F);
@@ -218,12 +220,17 @@ static Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
     }
     break;
   case ShflKind::up: {
+    unsigned iWarpSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+    Value warpSize = b.i32_val(iWarpSize);
+    Value laneId = b.urem(threadId, warpSize);
     Value mask = b.icmp_slt(laneId, i);
     Value delta = b.sub(laneId, i);
     Value index = b.select(mask, laneId, delta);
+llvm::errs()<<"\nShflKind::up\n";
     return bpermute(index);
   }
   case ShflKind::idx:
+llvm::errs()<<"\nShflKind::idx\n";
     return bpermute(i);
   default:
     assert(false && "Unsupported ShflKind");

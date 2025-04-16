@@ -131,6 +131,7 @@ struct DotOpMFMAConversionHelper {
     if (reduceSubBlocks) {
       while (subBlockSize < warpSize) {
         for (int i = 0; i < numScalars; ++i) {
+llvm::errs()<<" reduceSubBlocks\n";
           Value other_acc =
               shuffleXor(loc, rewriter, accScalar[i], subBlockSize);
           if (elemType.isInteger(32))

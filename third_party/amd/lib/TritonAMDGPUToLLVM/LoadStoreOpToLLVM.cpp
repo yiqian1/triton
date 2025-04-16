@@ -582,6 +582,7 @@ struct BufferLoadToLocalOpConversion
       Value pred = mask ? maskElems[srcIdx] : b.true_val();
 
       if (hasSwizzling) {
+llvm::errs()<<"\nbufferload\n";
         // Apply swizzling to the src offsets
         Value swizzledLaneId =
             emitSwizzledLaneIndex(rewriter, b, loc, coalescedShmemAddr[i],
@@ -706,6 +707,7 @@ struct AsyncCopyGlobalToLocalOpConversion
       Value pred = maskElements.empty() ? b.true_val() : maskElems[srcIdx];
 
       if (hasSwizzling) {
+llvm::errs()<<"\ncopyGlobal\n";
         // Apply swizzling to the src pointers
         Value swizzledLaneId =
             emitSwizzledLaneIndex(rewriter, b, loc, coalescedShmemAddr[i],
