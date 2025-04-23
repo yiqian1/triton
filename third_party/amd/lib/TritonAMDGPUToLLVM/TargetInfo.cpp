@@ -240,13 +240,11 @@ static bool warpReduceCDNA4(RewriterBase &rewriter, Location loc,
   Value val = acc[0];
   unsigned bits = val.getType().getIntOrFloatBitWidth();
   if ( bits > 32) return false;
-/*
-  RankedTensorType resultTy;
-  if (resultTy = dyn_cast<RankedTensorType>(op.getResult().getType())){
-  if (!isa<AMDMfmaEncodingAttr>(resultTy.getEncoding()))
+
+  auto resultTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+  if (not resultTy)
     return false;
-  }
-  else
+  if (!isa<AMDMfmaEncodingAttr>(resultTy.getEncoding()))
     return false;
 
   auto mfmaLayout = cast<AMDMfmaEncodingAttr>(resultTy.getEncoding());
@@ -259,9 +257,7 @@ static bool warpReduceCDNA4(RewriterBase &rewriter, Location loc,
     intrinsic = "llvm.amdgcn.permlane32.swap";
   else
     return false;
-*/
-  std::string intrinsic;
-    intrinsic = "llvm.amdgcn.permlane16.swap";
+
   Type valType = val.getType();
   Type actualType = valType;
   if (!valType.isInteger(32))
