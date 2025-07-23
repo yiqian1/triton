@@ -47,6 +47,8 @@ SmallVector<Value, 4> mxfp4Scale_HW(RewriterBase &rewriter, Location loc,
   results.push_back(rewriter.create<ConvertOp>(loc, resType, packedVec,
                                                scaleF32,
                                                /*srcSelIndex=*/0));
+  // Intentionally swap the byte indices 1 and 2 to align with how the LLVM
+  // backend accesses them
   results.push_back(rewriter.create<ConvertOp>(loc, resType, packedVec,
                                                scaleF32,
                                                /*srcSelIndex=*/2));
@@ -199,40 +201,6 @@ SmallVector<Value, 4> upcast8xMxfp4(RewriterBase &rewriter,
   return {res_10, res_32, res_54, res_76};
 }
 
-SmallVector<Value> upcastMxfp4(RewriterBase &rewriter,
-                               amdgpu::UpcastMXFPOp upcastOp, bool toFp16,
-                               ArrayRef<Value> values) {
-  assert(values.size() % 4 == 0);
-  Location loc = upcastOp.getLoc();
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-  Value fp16OVFLModeRegLoc = b.i32_val(1473);
-  LLVM::createLLVMIntrinsicCallOp(rewriter, loc, "llvm.amdgcn.s.setreg", {},
-                                  {fp16OVFLModeRegLoc, b.i32_val(1)});
-
-  SmallVector<Value> results;
-  results.reserve(values.size() * 2);
-  Type elemType = toFp16 ? f16_ty : bf16_ty;
-  for (int i = 0; i < values.size(); i += 4) {
-    Value v0 = values[i];
-    Value v1 = values[i + 1];
-    Value v2 = values[i + 2];
-    Value v3 = values[i + 3];
-    Value packedVec = b.undef(vec_ty(i8_ty, 4));
-    packedVec = b.insert_element(packedVec, v0, b.i32_val(0));
-    packedVec = b.insert_element(packedVec, v1, b.i32_val(1));
-    packedVec = b.insert_element(packedVec, v2, b.i32_val(2));
-    packedVec = b.insert_element(packedVec, v3, b.i32_val(3));
-    SmallVector<Value, 4> v4i32 =
-        upcast8xMxfp4_HW(rewriter, upcastOp, toFp16, packedVec);
-    for (int j = 0; j < 4; j++) {
-      Value elements = b.bitcast(v4i32[j], vec_ty(elemType, 2));
-      results.push_back(b.extract_element(elements, b.i32_val(0)));
-      results.push_back(b.extract_element(elements, b.i32_val(1)));
-    }
-  }
-  return results;
-}
-
 Value mxfpScaleFp16(RewriterBase &rewriter, Location loc, Value v, Value scale,
                     bool fastMath) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
@@ -300,9 +268,6 @@ public:
     auto scaleVals = unpackLLElements(loc, adaptor.getScale(), rewriter);
     LDBG("x: " << xVals.size() << " x " << xVals.front().getType());
     LDBG("scale: " << scaleVals.size() << " x " << scaleVals.front().getType());
-    // llvm::outs()<<"x: " << xVals.size() << " x " << xVals.front().getType();
-    // llvm::outs()<<" scale: " << scaleVals.size() << " x " <<
-    // scaleVals.front().getType() <<"\n";
     SmallVector<Value> yVals;
     yVals.reserve(2 * xVals.size());
 
