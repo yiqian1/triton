@@ -61,6 +61,38 @@ SmallVector<Value, 4> mxfp4Scale_HW(RewriterBase &rewriter, Location loc,
   return results;
 }
 
+template <typename ConvertOp>
+SmallVector<Value, 2> mxfp8Scale_HW(RewriterBase &rewriter, Location loc,
+                                    const SmallVector<Value> &xVals, int idx,
+                                    Value scale) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value v0 = xVals[idx];
+  Value v1 = xVals[idx + 1];
+  Value v2 = xVals[idx + 2];
+  Value v3 = xVals[idx + 3];
+  Value packedVec = b.undef(vec_ty(i8_ty, 4));
+  packedVec = b.insert_element(packedVec, v0, b.i32_val(0));
+  packedVec = b.insert_element(packedVec, v1, b.i32_val(1));
+  packedVec = b.insert_element(packedVec, v2, b.i32_val(2));
+  packedVec = b.insert_element(packedVec, v3, b.i32_val(3));
+  packedVec = b.bitcast(packedVec, i32_ty);
+  Type retElemType = bf16_ty;
+  if constexpr (std::is_same_v<ConvertOp, ROCDL::CvtScaleF32PkF16Fp8Op> ||
+                std::is_same_v<ConvertOp, ROCDL::CvtScaleF32PkF16Bf8Op>)
+    retElemType = f16_ty;
+  Type resType = vec_ty(retElemType, 2);
+  Value scaleF32 =
+      b.bitcast(b.shl(b.zext(i32_ty, scale), b.i32_val(23)), f32_ty);
+  SmallVector<Value, 2> results;
+  results.push_back(rewriter.create<ConvertOp>(loc, resType, packedVec,
+                                               scaleF32,
+                                               /*srcLoHiSel=*/false));
+  results.push_back(rewriter.create<ConvertOp>(loc, resType, packedVec,
+                                               scaleF32,
+                                               /*srcLoHiSel=*/true));
+  return results;
+}
+
 SmallVector<Value, 4> upcast8xMxfp4(RewriterBase &rewriter,
                                     amdgpu::UpcastMXFPOp upcastOp, bool tofp16,
                                     Value packedVec) {
@@ -322,13 +354,11 @@ public:
         if (isPacked) {
           for (int j = 0; j < 16; j += 4) {
             auto idx = 16 * i + j;
-            SmallVector<Value, 4> v4i32;
-            if (useFp16)
-              v4i32 = mxfp4Scale_HW<ROCDL::CvtScaleF32PkF16Fp4Op>(
-                  rewriter, loc, xVals, idx, si[j / 8]);
-            else
-              v4i32 = mxfp4Scale_HW<ROCDL::CvtScaleF32PkBf16Fp4Op>(
-                  rewriter, loc, xVals, idx, si[j / 8]);
+            SmallVector<Value, 4> v4i32 =
+                useFp16 ? mxfp4Scale_HW<ROCDL::CvtScaleF32PkF16Fp4Op>(
+                              rewriter, loc, xVals, idx, si[j / 8])
+                        : mxfp4Scale_HW<ROCDL::CvtScaleF32PkBf16Fp4Op>(
+                              rewriter, loc, xVals, idx, si[j / 8]);
             for (int k = 0; k < 4; k++) {
               Value elements = b.bitcast(v4i32[k], vec_ty(retElemType, 2));
               yVals.push_back(b.extract_element(elements, b.i32_val(0)));
@@ -336,13 +366,25 @@ public:
             }
           }
         } else {
-          for (int j = 0; j < 32; j++) {
+          for (int j = 0; j < 32; j += 4) {
             auto idx = 32 * i + j;
-            xVals[idx] =
-                useFp16 ? mxfpScaleFp16(rewriter, loc, xVals[idx], si[j / 16],
-                                        op.getFastMath())
-                        : mxfpScaleBf16ViaF32(rewriter, loc, xVals[idx],
-                                              si[j / 16], op.getFastMath());
+            SmallVector<Value, 2> v2i32 =
+                useFp16 ? (fpType == ScaleDotElemType::E4M3
+                               ? mxfp8Scale_HW<ROCDL::CvtScaleF32PkF16Fp8Op>(
+                                     rewriter, loc, xVals, idx, si[j / 16])
+                               : mxfp8Scale_HW<ROCDL::CvtScaleF32PkF16Bf8Op>(
+                                     rewriter, loc, xVals, idx, si[j / 16]))
+                        : (fpType == ScaleDotElemType::E4M3
+                               ? mxfp8Scale_HW<ROCDL::CvtScaleF32PkBf16Fp8Op>(
+                                     rewriter, loc, xVals, idx, si[j / 16])
+                               : mxfp8Scale_HW<ROCDL::CvtScaleF32PkBf16Bf8Op>(
+                                     rewriter, loc, xVals, idx, si[j / 16]));
+            for (int k = 0; k < 2; k++) {
+              Value elements = b.bitcast(v2i32[k], vec_ty(retElemType, 2));
+              xVals[idx + k * 2] = b.extract_element(elements, b.i32_val(0));
+              xVals[idx + k * 2 + 1] =
+                  b.extract_element(elements, b.i32_val(1));
+            }
           }
         }
       }
@@ -363,16 +405,14 @@ public:
             targetInfo.shuffleIdx(rewriter, loc, scaleVal, scaleThreads[3]),
         };
 
-        SmallVector<Value, 4> v4i32;
         if (isPacked) {
           for (int j = 0; j < 16; j += 4) {
             auto idx = 16 * i + j;
-            if (useFp16)
-              v4i32 = mxfp4Scale_HW<ROCDL::CvtScaleF32PkF16Fp4Op>(
-                  rewriter, loc, xVals, idx, si[j / 4]);
-            else
-              v4i32 = mxfp4Scale_HW<ROCDL::CvtScaleF32PkBf16Fp4Op>(
-                  rewriter, loc, xVals, idx, si[j / 4]);
+            SmallVector<Value, 4> v4i32 =
+                useFp16 ? mxfp4Scale_HW<ROCDL::CvtScaleF32PkF16Fp4Op>(
+                              rewriter, loc, xVals, idx, si[j / 4])
+                        : mxfp4Scale_HW<ROCDL::CvtScaleF32PkBf16Fp4Op>(
+                              rewriter, loc, xVals, idx, si[j / 4]);
 
             for (int k = 0; k < 4; k++) {
               Value elements = b.bitcast(v4i32[k], vec_ty(retElemType, 2));
@@ -381,13 +421,25 @@ public:
             }
           }
         } else {
-          for (int j = 0; j < 32; j++) {
+          for (int j = 0; j < 32; j += 4) {
             auto idx = 32 * i + j;
-            xVals[idx] = useFp16
-                             ? mxfpScaleFp16(rewriter, loc, xVals[idx],
-                                             si[j / 8], op.getFastMath())
-                             : mxfpScaleBf16ViaF32(rewriter, loc, xVals[idx],
-                                                   si[j / 8], op.getFastMath());
+            SmallVector<Value, 2> v2i32 =
+                useFp16 ? (fpType == ScaleDotElemType::E4M3
+                               ? mxfp8Scale_HW<ROCDL::CvtScaleF32PkF16Fp8Op>(
+                                     rewriter, loc, xVals, idx, si[j / 8])
+                               : mxfp8Scale_HW<ROCDL::CvtScaleF32PkF16Bf8Op>(
+                                     rewriter, loc, xVals, idx, si[j / 8]))
+                        : (fpType == ScaleDotElemType::E4M3
+                               ? mxfp8Scale_HW<ROCDL::CvtScaleF32PkBf16Fp8Op>(
+                                     rewriter, loc, xVals, idx, si[j / 8])
+                               : mxfp8Scale_HW<ROCDL::CvtScaleF32PkBf16Bf8Op>(
+                                     rewriter, loc, xVals, idx, si[j / 8]));
+            for (int k = 0; k < 2; k++) {
+              Value elements = b.bitcast(v2i32[k], vec_ty(retElemType, 2));
+              xVals[idx + k * 2] = b.extract_element(elements, b.i32_val(0));
+              xVals[idx + k * 2 + 1] =
+                  b.extract_element(elements, b.i32_val(1));
+            }
           }
         }
       }
