@@ -164,8 +164,8 @@ Value generateMaskFromOffsetRanges(OpBuilder &builder, const Location &loc,
     auto offsetWithRange = offsetRanges[i];
 
     // Compare with lower bound
-    Value lowerBound = builder.create<mlir::arith::ConstantIntOp>(
-        loc, 0, builder.getI64Type());
+    Value lowerBound = mlir::arith::ConstantIntOp::create(builder,
+        loc, builder.getI64Type(), 0);
     Value splatLowerBound = builder.create<triton::SplatOp>(
         loc, offsetRanges[i].getType(), lowerBound);
     Value cmpLower = builder.create<arith::CmpIOp>(
