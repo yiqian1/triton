@@ -15,6 +15,7 @@
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
+using ::mlir::LLVM::AMD::hasTransInDefChain;
 using ::mlir::LLVM::AMD::isChainDotHead;
 using ::mlir::LLVM::AMD::isChainDotTail;
 using ::mlir::LLVM::AMD::scaleDotElemTypeToMLIRType;
@@ -474,11 +475,28 @@ public:
     // requires to broadcast the operand A.
     bool isTransposed = !(mDim == 4 && nDim == 64);
     auto aElemTy = mfmaInstr->aElementType;
-    ttg::AMDMfmaEncodingAttr mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
-        oldRetType.getContext(),
-        /*version*/ mfmaVersion, warpsPerTile,
-        /*instrShape*/ mDim, nDim, /*isTransposed=*/isTransposed, CTALayout,
-        mfmaAccType);
+    bool isMfma16InBwdFA =
+        (aElemTy.isF16() || aElemTy.isBF16()) && mDim == 16 && nDim == 16 &&
+        hasTransInDefChain(dotOp, 1U) && oldAType.getRank() == 2 &&
+        oldAType.getShape().front() >= 16 * 2 &&
+        oldBType.getShape().back() == 16;
+
+    ttg::AMDMfmaEncodingAttr mfmaEnc;
+    if (isMfma16InBwdFA) {
+      mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
+          oldRetType.getContext(),
+          /*version*/ mfmaVersion, warpsPerTile, {2, 1},
+          /*instrShape*/ mDim, nDim, /*isTransposed=*/isTransposed, CTALayout,
+          mfmaAccType);
+    } else {
+      mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
+          oldRetType.getContext(),
+          /*version*/ mfmaVersion, warpsPerTile,
+          /*instrShape*/ mDim, nDim, /*isTransposed=*/isTransposed, CTALayout,
+          mfmaAccType);
+    }
+
+    // llvm::outs()<<"\nBlockedToMFMA got "<<mfmaEnc<<"\n";
 
     // convert accumulator
     auto oldAcc = dotOp.getC();
@@ -524,6 +542,15 @@ public:
     // TODO (lixun): relax the condition for 8-bit elementTy.
     if ((aElemTy.isF16() || aElemTy.isBF16()) && isChainDotTail(dotOp))
       kWidth = 4;
+
+    if ((aElemTy.isF16() || aElemTy.isBF16()) &&
+        hasTransInDefChain(dotOp, 1U)) {
+      if (isChainDotHead(dotOp)) {
+        kWidth = 4;
+      } else if (isChainDotTail(dotOp)) {
+        kWidth = 8;
+      }
+    }
 
     Value newDot;
     if (withScale) {
