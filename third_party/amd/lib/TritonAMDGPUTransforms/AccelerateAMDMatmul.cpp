@@ -479,7 +479,7 @@ public:
         (aElemTy.isF16() || aElemTy.isBF16()) && mDim == 16 && nDim == 16 &&
         hasTransInDefChain(dotOp, 1U) && oldAType.getRank() == 2 &&
         oldAType.getShape().front() >= 16 * 2 &&
-        oldBType.getShape().back() == 16;
+        oldBType.getShape().back() == 16 && isChainDotHead(dotOp);
 
     ttg::AMDMfmaEncodingAttr mfmaEnc;
     if (isMfma16InBwdFA) {
@@ -553,16 +553,8 @@ public:
     if (is16BitElemTy && hasTransInDefChain(dotOp, 1u)) {
       if (isChainDotHead(dotOp)) {
         kWidth = 4;
+        if (isMfma16InBwdFA) kWidth = 8;
       } else if (isDotChainTail) {
-        kWidth = 8;
-      }
-    }
-
-    if ((aElemTy.isF16() || aElemTy.isBF16()) &&
-        hasTransInDefChain(dotOp, 1U)) {
-      if (isChainDotHead(dotOp)) {
-        kWidth = 4;
-      } else if (isChainDotTail(dotOp)) {
         kWidth = 8;
       }
     }
