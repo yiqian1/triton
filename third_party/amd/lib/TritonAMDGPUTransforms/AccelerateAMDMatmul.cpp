@@ -477,15 +477,14 @@ public:
     auto aElemTy = mfmaInstr->aElementType;
     bool isMfma16InBwdFA =
         (aElemTy.isF16() || aElemTy.isBF16()) && mDim == 16 && nDim == 16 &&
-        hasTransInDefChain(dotOp, 1U) && oldAType.getRank() == 2 &&
-        oldAType.getShape().front() >= 16 * 2 &&
+        oldAType.getRank() == 2 && oldAType.getShape().front() >= 16 * 2 &&
         oldBType.getShape().back() == 16 && isChainDotHead(dotOp);
 
     ttg::AMDMfmaEncodingAttr mfmaEnc;
     if (isMfma16InBwdFA) {
       mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
           oldRetType.getContext(),
-          /*version*/ mfmaVersion, warpsPerTile, {2, 1},
+          /*version*/ mfmaVersion, warpsPerTile, /*tilesPerWarp=*/{2, 1},
           /*instrShape*/ mDim, nDim, /*isTransposed=*/isTransposed, CTALayout,
           mfmaAccType);
     } else {
@@ -495,8 +494,6 @@ public:
           /*instrShape*/ mDim, nDim, /*isTransposed=*/isTransposed, CTALayout,
           mfmaAccType);
     }
-
-    // llvm::outs()<<"\nBlockedToMFMA got "<<mfmaEnc<<"\n";
 
     // convert accumulator
     auto oldAcc = dotOp.getC();
@@ -553,10 +550,13 @@ public:
     if (is16BitElemTy && hasTransInDefChain(dotOp, 1u)) {
       if (isChainDotHead(dotOp)) {
         kWidth = 4;
-        if (isMfma16InBwdFA) kWidth = 8;
       } else if (isDotChainTail) {
         kWidth = 8;
       }
+    }
+
+    if (isMfma16InBwdFA) {
+      kWidth = 8;
     }
 
     Value newDot;
