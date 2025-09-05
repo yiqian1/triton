@@ -349,10 +349,7 @@ LogicalResult lowerLdStMatrix(
           }
           inputs.push_back(b.bitcast(input, i32_ty));
         }
-        rewriter.create<NVVM::StMatrixOp>(
-            loc, vecAddr, inputs, layout,
-            NVVM::LdStMatrixShapeAttr::get(ctx, 8, 8),
-            NVVM::LdStMatrixEltType::B16);
+        rewriter.create<NVVM::StMatrixOp>(loc, vecAddr, inputs, layout);
       } else {
         Type matTy = nVecs == 1
                          ? i32_ty

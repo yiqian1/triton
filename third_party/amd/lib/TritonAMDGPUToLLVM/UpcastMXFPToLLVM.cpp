@@ -101,7 +101,9 @@ SmallVector<Value, 4> upcast8xMxfp4_HW(RewriterBase &rewriter, Location loc,
   Value scaleF32 =
       b.bitcast(b.shl(b.zext(i32_ty, scale), b.i32_val(23)), f32_ty);
   SmallVector<Value, 4> results;
-  for (int srcSelIndex : llvm::seq(4))
+  // Intentionally swap the byte indices 1 and 2 to align with how the LLVM
+  // backend accesses them
+  for (int srcSelIndex : {0, 2, 1, 3})
     results.push_back(rewriter.create<ConvertOp>(loc, resType, packedVec,
                                                  scaleF32, srcSelIndex));
   return results;
