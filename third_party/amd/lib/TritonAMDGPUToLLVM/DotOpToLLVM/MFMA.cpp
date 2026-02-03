@@ -199,6 +199,7 @@ struct DotOpMFMAConversionHelper {
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     for (unsigned v = 0; v < elemsPerVec; ++v) {
       Value accElem = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
+      /*
       if (kDimInstrSize > kDimOperandSize) {
         assert(kDimInstrSize % kDimOperandSize == 0);
         int duplicationRate = kDimInstrSize / kDimOperandSize;
@@ -216,6 +217,7 @@ struct DotOpMFMAConversionHelper {
           accElem = tb.fmul(accElem, multiplierVal);
         }
       }
+      */
       auto linearIdx = b * numRepM * numRepN * elemsPerVec +
                        m * numRepN * elemsPerVec + n * elemsPerVec + v;
       fc[linearIdx] = accElem;
@@ -317,13 +319,14 @@ struct DotOpMFMAConversionHelper {
     numRepK = std::max(numRepKA, numRepKB);
     int numBroadcast = std::max(numBroadcastA, numBroadcastB);
 
+    int duplicationRate = kDimInstrSize / kDimOperandSize;
     bool preserveBF16 = intrinsicName.contains(".bf16") && mfmaVersion >= 4;
     auto operandA = getValuesFromDotOperandLayoutStruct(
         loadedA, numRepB, numRepM, numRepKA, kWidth, kBase,
-        aTensorTy.getElementType(), allowXF32, preserveBF16);
+        aTensorTy.getElementType(), allowXF32, preserveBF16, duplicationRate);
     auto operandB = getValuesFromDotOperandLayoutStruct(
         loadedB, numRepB, numRepN, numRepKB, kWidth, kBase,
-        aTensorTy.getElementType(), allowXF32, preserveBF16);
+        aTensorTy.getElementType(), allowXF32, preserveBF16, duplicationRate);
 
     int warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
     int elemsPerVec = mDim * nDim / warpSize;
@@ -459,7 +462,7 @@ struct DotOpMFMAConversionHelper {
   /// appropriate for mfma instructions
   virtual ValueTable getValuesFromDotOperandLayoutStruct(
       Value value, int batch, int nonKRep, int kRepInKWidth, int kWidth,
-      int kBase, Type type, bool allowXF32, bool preserveBF16,
+      int kBase, Type type, bool allowXF32, bool preserveBF16, int duplicationRate = 1,
       bool isConstantScale = false) const {
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto elems = unpackLLElements(loc, value, rewriter);
@@ -472,6 +475,17 @@ struct DotOpMFMAConversionHelper {
     }
     ValueTable dotOpVals;
 
+    Type elemTy = typeConverter->convertType(type);
+    Value cst0;
+    if (elemTy.isF32())
+      cst0 = tb.f32_val(0.0);
+    else if (elemTy.isF16())
+      cst0 = tb.f16_val(0.0);
+    else if (elemTy.isBF16())
+      cst0 = tb.bf16_val(0.0);
+    else
+      cst0 = tb.i8_val(0);
+
     SmallVector<int64_t> strides =
         computeStrides({batch, nonKRep, numVecInKBase, kBase});
     for (int b = 0; b < batch; ++b) {
@@ -482,13 +496,16 @@ struct DotOpMFMAConversionHelper {
           // Step 1: construct each kBase-element vector by
           //         - extracting kBase elements from elems and
           //         - putting them into a kBase-element vector, i.e. rawElems
-          Type elemTy = typeConverter->convertType(type);
           Type ty = vec_ty(elemTy, kBase);
           Value rawElems = tb.undef(ty);
           for (int k = 0; k < kBase; ++k) {
             auto index = linearize({b, nonK, kBaseVec, k}, strides);
-            rawElems =
+	    if (index < elems.size()/duplicationRate)
+              rawElems =
                 tb.insert_element(ty, rawElems, elems[index], tb.i32_val(k));
+	    else
+              rawElems =
+                tb.insert_element(ty, rawElems, cst0, tb.i32_val(k));
           }
 
           // Step 2: process rawElems based on element type
@@ -679,12 +696,13 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     int aNonKPackedVals = scaleAKBase / akPackedVals;
     int bNonKPackedVals = scaleBKBase / bkPackedVals;
 
+    int duplicationRate = kDimInstrSize / kDimOperandSize;
     auto operandA = getValuesFromDotOperandLayoutStruct(
         loadedA, numRepB, numRepM, numRepK, aKWidth, aKBase,
-        aTensorTy.getElementType(), allowXF32, /*preserveBF16=*/false);
+        aTensorTy.getElementType(), allowXF32, /*preserveBF16=*/false, duplicationRate);
     auto operandB = getValuesFromDotOperandLayoutStruct(
         loadedB, numRepB, numRepN, numRepK, bKWidth, bKBase,
-        bTensorTy.getElementType(), allowXF32, /*preserveBF16=*/false);
+        bTensorTy.getElementType(), allowXF32, /*preserveBF16=*/false, duplicationRate);
 
     // Scales have the same replica distributions as their corresponding
     // operands.
@@ -694,13 +712,13 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
       auto aScaleTensorTy = cast<RankedTensorType>(aScale.getType());
       operandAScale = getValuesFromDotOperandLayoutStruct(
           loadedAScale, numRepB, numRepM, numRepK, scaleKWidth, scaleAKBase,
-          aScaleTensorTy.getElementType(), allowXF32, /*preserveBF16=*/false,
+          aScaleTensorTy.getElementType(), allowXF32, /*preserveBF16=*/false, duplicationRate,
           isAScaleConstant);
 
       auto bScaleTensorTy = cast<RankedTensorType>(bScale.getType());
       operandBScale = getValuesFromDotOperandLayoutStruct(
           loadedBScale, numRepB, numRepN, numRepK, scaleKWidth, scaleBKBase,
-          bScaleTensorTy.getElementType(), allowXF32, /*preserveBF16=*/false,
+          bScaleTensorTy.getElementType(), allowXF32, /*preserveBF16=*/false, duplicationRate,
           isBScaleConstant);
     }
 
