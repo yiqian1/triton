@@ -1,0 +1,58 @@
+g===============================================================
+Refactoring Plan: Moving AMD Prefetch to AMD Backend
+================================================================
+
+Objective:
+----------
+Currently lib/Dialect/TritonGPU/Transforms/Prefetch.cpp of David's 
+protptype branch contains both base class and AMD/NVIDIA implementations
+in a single file. This plan outlines moving AMD-specific code to 
+the AMD backend for:
+  - Better code organization and maintainability
+  - Hiding AMD-specific implementation details
+  - Independent evolution of AMD vs NVIDIA optimizations
+  - Following Triton's backend separation pattern
+
+Proposed Structure:
+-------------------
+  lib/Dialect/TritonGPU/Transforms/Prefetch.cpp           # Base + NVIDIA
+  third_party/amd/lib/TritonAMDGPUTransforms/Prefetch.cpp # AMD-specific
+
+Key Design Decisions: Use unified Base Pass (Not Separate AMD Pass)
+---------------------------------------------
+  - Consistent with other Triton passes
+  - Less code duplication in pipeline setup
+  - Both backends share common logic
+
+After Refactoring:
+------------------
+
+lib/Dialect/TritonGPU/Transforms/
+    Prefetch.cpp                              (~700 lines)
+        class Prefetcher                      # Abstract base class
+	class PrefetchNV : public Prefetcher  # NVIDIA implementation
+	createPrefetcher()                    # Factory function
+	struct PrefetchPass                   # Unified pass
+
+include/triton/Dialect/TritonGPU/Transforms/
+    Prefetch.h                                (NEW ~150 lines)
+        class Prefetcher                      # Base class declaration
+
+third_party/amd/lib/TritonAMDGPUTransforms/
+    Prefetch.cpp                              (~450 lines)
+        class PrefetchAMD : public gpu::Prefetcher  # AMD implementation
+        createAMDPrefetcher()                       # Factory function
+
+Dependencies:
+-------------
+Base Prefetch.cpp:
+  - Depends on: TritonGPU IR, SCF dialect, Triton IR
+  - Forward declares: amd::createAMDPrefetcher()
+
+AMD Prefetch.cpp:
+  - Depends on: Base Prefetch.h, ROCDL dialect, TritonGPU IR
+  - Links against: TritonGPUTransforms (for base class)
+
+================================================================
+End of Refactoring Plan
+================================================================

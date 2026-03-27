@@ -1,0 +1,189 @@
+================================================================
+Outline: Supporting Two Dot Ops in AMD Prefetch Pass
+================================================================
+
+Current Limitation:
+-------------------
+The AMD prefetch pass in David's prototype branch
+only handles exactly 1 dot per loop.
+
+Problem:
+--------
+Flash Attention and similar kernels have 2 sequential dots that could
+benefit from prefetching but are currently skipped.
+
+Motivation:
+-----------
+Flash Attention loop structure:
+  - DOT #1: Q @ K^T  (compute attention scores)
+  - Softmax: P = softmax(QK)
+  - DOT #2: P @ V    (apply attention to values)
+
+Key observations:
+  1. Independent operands: (Q, K) for dot1 vs (P, V) for dot2
+  2. Sequential dependency: dot2 depends on dot1 result (through softmax)
+  3. Only K and V are loop arguments needing prefetch
+  4. Q is loop-invariant; P is computed from dot1 (neither prefetchable)
+
+================================================================
+Required Changes (High-Level)
+================================================================
+
+Change 1: Allow Partial Prefetching
+------------------------------------
+Current limitation:
+  Both A and B operands must be prefetchable loop arguments
+
+New capability:
+  Support prefetching only A, only B, or both
+
+Affected components:
+  - initialize(): Pattern matching and validation
+  - emitPrologue(): Prologue generation
+  - createNewForOp(): Loop argument creation
+  - generatePrefetchingLocalLoads(): Epilogue generation
+
+Rationale:
+  In FA, dot1 prefetches only K (Q is invariant)
+  In FA, dot2 prefetches only V (P is dependent)
+
+Change 2: Per-Dot Tile Sizes
+-----------------------------
+Current limitation:
+  Single set of prefetchWidthM/N/K shared by all dots
+
+New capability:
+  Each dot can have different tile dimensions
+
+Affected components:
+  - Data structures: Add per-dot tile size storage
+  - computePrefetchWidths(): Return tile sizes per dot
+  - generateDotsAndNonPrefetchingLocalLoads(): Use per-dot tiles
+  - generatePrefetch(): Accept tile size parameters
+
+Rationale:
+  Dot1 (Q@K) and Dot2 (P@V) may have different optimal tile sizes
+  Different shapes and encodings may benefit from different slicing
+
+Change 3: Respect Dot Dependencies
+-----------------------------------
+Current limitation:
+  Dots are processed independently (no dependency awareness)
+
+New capability:
+  Maintain execution order to preserve dependencies
+
+Implementation options:
+
+  Option A: Sequential Processing
+  --------------------------------
+  Strategy:
+    - Complete all slices of dot1
+    - Process intermediate ops (softmax)
+    - Complete all slices of dot2
+
+  Schedule:
+    - All dot1 slices -> softmax -> all dot2 slices
+
+  Pros:
+    - Simple implementation
+    - Minimal code changes
+    - Dependencies naturally preserved
+
+  Cons:
+    - May miss optimization opportunities
+    - Cannot overlap dot1 and dot2 operations
+
+  Option B: Smart Load Overlap
+  -----------------------------
+  Strategy:
+    - Prefetch dot2 operands during dot1 computation
+    - Respect dependency between dot1 result and dot2 input
+
+  Schedule:
+    - Loads for dot2 can overlap with dot1 computation
+    - Dot2 execution waits for dot1 completion
+
+  Pros:
+    - Better latency hiding
+    - More efficient resource utilization
+
+  Cons:
+    - More complex implementation
+    - Requires dependency analysis
+    - Higher register pressure
+
+Recommendation:
+  Start with Option A (sequential processing)
+  Upgrade to Option B if performance gains justify complexity
+
+================================================================
+Implementation Scope
+================================================================
+
+Minimum Viable Support (Phase 1):
+----------------------------------
+  - Remove single-dot restriction (allow up to 2 dots)
+  - Support partial prefetching (A only, B only, or both)
+  - Sequential dot processing (Option A)
+  - Shared tile sizes for simplicity
+
+Target use case:
+  Flash Attention with num_stages=1
+
+Advanced Optimization (Phase 2):
+---------------------------------
+  - Per-dot tile size calculation
+  - Load overlap across dots (Option B)
+  - Dependency analysis infrastructure
+
+Target outcome:
+  Optimal performance for multi-dot kernels
+
+================================================================
+Testing Requirements
+================================================================
+
+Correctness:
+  - Flash Attention kernel produces correct results
+  - Single-dot cases still work (no regression)
+  - MXFP support preserved (DotScaledOp)
+  - Dependencies respected (no reordering bugs)
+
+Performance:
+  - No VGPR spilling (monitor register usage)
+  - Measurable speedup over non-prefetched version
+  - Kernel occupancy remains acceptable
+
+Validation tests:
+  - test_tdm_mxfp_fa.py with num_stages=1
+  - test_tdm_mxfp_gemm.py (single-dot regression)
+  - IR dump verification (structure check)
+
+================================================================
+Success Criteria
+================================================================
+
+After implementing 2-dot support:
+
+ - Flash Attention works with prefetch enabled
+ - test_tdm_mxfp_fa.py passes with num_stages=1
+ - No correctness regressions in existing tests
+ - VGPR usage remains reasonable (no spilling)
+ - Code changes are localized and maintainable
+ - Performance improvement is measurable
+
+================================================================
+Future Considerations
+================================================================
+
+Generalizing to N dots (if needed):
+  - Current plan: exactly 2 dots
+  - Future: arbitrary number of dots
+  - Challenges: register pressure, dependency graphs, scheduling complexity
+
+For now: 2-dot support covers most important use cases (Flash Attention)
+
+================================================================
+End of Outline
+================================================================

@@ -1,0 +1,152 @@
+AMD Prefetch Pass Based on David's Prototype Branch
+(https://github.com/triton-lang/triton/pull/9411)
+
+****************************************
+AMD Prefetch is applied when: (initialize())
+1. exactly one dot or dot_scaled per loop
+2. Uses AMD MFMA or WMMA encoding
+3. Operands from LocalLoadOp
+4. Operands are in single-use chain
+5. Operands must be loop arguments
+
+*****************************************
+Tile Size Calculation (computePrefetchWidth())
+M/N/K 3D slicing based on heuristic (arch, transpose, warp config etc)
+goal: Enough instructions to hide LDS latency while not too many to acoid register pressure
+1. Determine instruction count = LDS latency/MFMA latency and round to next power of 2
+Exanmple: 
+  LDS latency = 40 cycles
+  MFMA latency = 16 cycles
+  numInsts: 40/16  = 2.5 -> round to 4 (next power of 2)
+2. Set Minimum Transpose Width (mtw) to avoid bank conflicts (?)
+3. Calculate base tile 
+  Start with 1x1x1 tile
+  if transposed, enforce minimum tile size to ensure minimum tranpose width
+Example:
+  if (transA) {
+      m = std::max(1u, mtw / instrShape[0]);  // e.g., 128/32 = 4 insts along M
+      k = std::max(1u, mtw / instrShape[2]);  // e.g., 128/16 = 8 insts along K
+  }
+
+  // If B is transposed
+  if (transB) {
+      n = std::max(1u, mtw / instrShape[1]);  // e.g., 128/32 = 4 insts along N
+      k = std::max(1u, mtw / instrShape[2]);
+  }
+
+  // Adjust numInsts based on base tile
+  numInsts /= (m * n * k);  // e.g., 4 / (4*1*8) = 0.125 -> need to grow
+
+
+4. Iteratively increase tile size until target numInsts MFMA instructions get sufficient data
+Strategy: prefer M -> N -> K growth order (better for LLVM scheduling)
+
+5. Convert from instruction counts to actual elemnt counts based on CTA tile shape
+  // Convert from instruction counts to actual element counts
+  m *= instrShape[0] * warpsPerCta[0];  // e.g., 4 * 32 * 1 = 128 elements
+  n *= instrShape[1] * warpsPerCta[1];  // e.g., 2 * 32 * 1 = 64 elements
+  k *= instrShape[2];                    // e.g., 8 * 16 = 128 elements
+
+  // Clamp to actual sizes
+  m = std::min(m, mSize);
+  n = std::min(n, nSize);
+  k = std::min(k, kSize);
+
+  return {m, n, k};  // (prefetchWidthM, prefetchWidthN, prefetchWidthK)
+
+  Example: WMMA on gfx1250
+
+  Input:
+  - Dot size: 256 x 256 x12
+  - instrShape: [32, 32, 16]
+  - warpsPerCta: [1, 1]
+  - transA=false, transB=false
+  - arch="gfx1250" -> mtw=128
+
+  Calculation:
+  1. numInsts = 4 (target)
+  2. mtw = 128
+  3. Base tile: m=1, n=1, k=1 (no transpose constraints)
+  4. Grow to hit numInsts=4:
+     - m=1 -> m=2 (numInsts=2)
+     - m=2 -> m=4 (numInsts=1) -> Target reached!
+  5. Convert to elements:
+     - m = 4 * 32 * 1 = 128
+     - n = 1 * 32 * 1 = 32
+     - k = 1 * 16 = 16
+  6. Result: prefetchWidth = (128, 32, 16)
+
+  Result: Splits 256 x 256 x 512 into:
+  - M: 256/128 = 2 slices
+  - N: 256/32 = 8 slices
+  - K: 512/16 = 32 slices
+  - Total: 2x8x32 = 512 sub-dots
+
+*****************************************************
+Generate Prologue (emitPrologue())
+Purpose: Load the first tile [M=0, N=0, K=0] before the loop starts
+
+*****************************************************
+Loop Transformation (createNewForOp())
+
+1. The new loop has two new iterator arguments for prefetched data
+2. Generate 3D Sliced Dots (generateDotsAndNonPrefetchingLocalLoads)
+For MXFP, also slice scales
+3. Prefetch for Next Iteration (generatePrefetchingLocalLoads
+
+  Complete Transformation Example
+
+  Input IR (Simplified):
+
+  scf.for %iv = 0 to 10 iter_args(%a_mem, %b_mem, %c_acc) {
+      %a = local_load %a_mem : tensor<256x512xf16>
+      %b = local_load %b_mem : tensor<512x256xf16>
+      %c = tt.dot %a, %b, %c_acc : tensor<256x256xf32>
+      scf.yield %a_mem_next, %b_mem_next, %c
+  }
+
+  After AMD Prefetch (prefetchWidth=128×32×16):
+
+  // ========== PROLOGUE ==========
+  %a_pf = local_load %a_mem[0:128, 0:16]      // Prefetch A[0,0,0]
+  %b_pf = local_load %b_mem[0:16, 0:32]       // Prefetch B[0,0,0]
+
+  scf.for %iv = 0 to 10 iter_args(%a_mem, %b_mem, %c_acc,
+                                   %a_pf_arg, %b_pf_arg) {  // ← New args
+
+      // ========== K=0 Loop ==========
+      // M=0, N=0: Use prefetched (from previous iteration)
+      %c_0_0 = tt.dot %a_pf_arg, %b_pf_arg, %c_acc[0:128, 0:32]
+
+      // M=0, N=32: Load B[0:16, 32:64], reuse A
+      %b_0_32 = local_load %b_mem[0:16, 32:64]
+      sched.barrier  // ← AMD scheduling hint
+      %c_0_32 = tt.dot %a_pf_arg, %b_0_32, %c_acc[0:128, 32:64]
+
+      // ... continue for all N slices (N=64, 96, ..., 224) ...
+
+      // M=128, N=0: Load A[128:256, 0:16], reuse B
+      %a_128_0 = local_load %a_mem[128:256, 0:16]
+      sched.barrier
+      %c_128_0 = tt.dot %a_128_0, %b_pf_arg, %c_acc[128:256, 0:32]
+
+      // ... continue for M=128, all N slices ...
+
+      // ========== K=16 Loop ==========
+      // M=0, N=0: Load new A and B
+      %a_0_0_16 = local_load %a_mem[0:128, 16:32]
+      %b_0_0_16 = local_load %b_mem[16:32, 0:32]
+      sched.barrier
+      %c_0_0 = tt.dot %a_0_0_16, %b_0_0_16, %c_0_0
+
+      // ... continue for all K, M, N combinations ...
+      // Total dots: (512/16) × (256/128) × (256/32) = 32 × 2 × 8 = 512 dots
+
+      // ========== EPILOGUE: Prefetch Next Iteration ==========
+      %a_pf_next = local_load %a_mem_next[0:128, 0:16]
+      %b_pf_next = local_load %b_mem_next[0:16, 0:32]
+
+      scf.yield %a_mem_next, %b_mem_next, %c_final,
+                %a_pf_next, %b_pf_next  // ← Pass prefetch to next iter
+  }
+
