@@ -122,6 +122,7 @@ def mxgemm_kernel(a_ptr, b_ptr, output_ptr,  #
                   BLOCK_N: tl.constexpr,  #
                   BLOCK_K: tl.constexpr,  #
                   GROUP_SIZE_M: tl.constexpr,  #
+                  NUM_K_SUBTILES: tl.constexpr = 1,  # NEW: K-dimension subtiling
                   ):
     """
     MXFP GEMM kernel: C = A @ B with microscaling.
@@ -129,6 +130,10 @@ def mxgemm_kernel(a_ptr, b_ptr, output_ptr,  #
     Computes matrix multiplication where inputs A and B use microscaling formats
     (fp4, fp8) with per-group scale factors in E8M0 format. Uses descriptor loads
     for both matrices and scales, with pre-shuffled scale layout for optimal performance.
+
+    Features (enhanced):
+    - K-dimension subtiling for better register pressure and ILP
+    - Software pipelining controlled by num_stages (set at launch)
 
     Args:
         a_ptr: Pointer to A matrix [M, K] in MXFP format
@@ -139,6 +144,7 @@ def mxgemm_kernel(a_ptr, b_ptr, output_ptr,  #
         DTYPE_A: Format type for A ("e2m1", "e5m2", or "e4m3")
         DTYPE_B: Format type for B ("e2m1", "e5m2", or "e4m3")
         SCALE_BLOCK: Elements per scale factor (32 for MX formats)
+        NUM_K_SUBTILES: Number of K-dimension subtiles (1=no subtiling, 2=split K in half)
     """
     # Packing factor for FP4 (2 elements per byte)
     DIV_FACTOR_A: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
@@ -195,8 +201,12 @@ def mxgemm_kernel(a_ptr, b_ptr, output_ptr,  #
     )
 
     # =========================================================================
-    # Main computation loop
+    # Main computation loop with K-dimension subtiling
     # =========================================================================
+    # K-subtiling constants
+    SUBTILE_K: tl.constexpr = BLOCK_K // NUM_K_SUBTILES
+    SUBTILE_K_SCALE: tl.constexpr = BLOCK_K_SCALE // NUM_K_SUBTILES
+
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=output_ptr.dtype.element_ty)
 
     for k in tl.range(0, tl.cdiv(K, BLOCK_K)):
@@ -206,22 +216,49 @@ def mxgemm_kernel(a_ptr, b_ptr, output_ptr,  #
 
         # Unshuffle in registers: [preshuffled_dim, K_scale_preshuffled] -> [dim, K_scale]
         SCALE_KWIDTH: tl.constexpr = 4 if BLOCK_K_SCALE >= 4 else BLOCK_K_SCALE
-        scale_a = tl.reshape(
+        scale_a_full = tl.reshape(
             scale_a_raw, (BLOCK_M_PRESHUFFLED, BLOCK_K_SCALE // SCALE_KWIDTH, PRESHUFFLE_FACTOR // 4, 4, SCALE_KWIDTH))
-        scale_a = tl.permute(scale_a, (0, 3, 2, 1, 4))
-        scale_a = tl.reshape(scale_a, (BLOCK_M, BLOCK_K_SCALE))
+        scale_a_full = tl.permute(scale_a_full, (0, 3, 2, 1, 4))
+        scale_a_full = tl.reshape(scale_a_full, (BLOCK_M, BLOCK_K_SCALE))
 
-        scale_b = tl.reshape(
+        scale_b_full = tl.reshape(
             scale_b_raw, (BLOCK_N_PRESHUFFLED, BLOCK_K_SCALE // SCALE_KWIDTH, PRESHUFFLE_FACTOR // 4, 4, SCALE_KWIDTH))
-        scale_b = tl.permute(scale_b, (0, 3, 2, 1, 4))
-        scale_b = tl.reshape(scale_b, (BLOCK_N, BLOCK_K_SCALE))
+        scale_b_full = tl.permute(scale_b_full, (0, 3, 2, 1, 4))
+        scale_b_full = tl.reshape(scale_b_full, (BLOCK_N, BLOCK_K_SCALE))
 
         # Load A and B matrices via descriptor load
-        a = a_desc.load([0, k * (BLOCK_K // DIV_FACTOR_A)])
-        b = b_desc.load([k * (BLOCK_K // DIV_FACTOR_B), 0])
+        a_full = a_desc.load([0, k * (BLOCK_K // DIV_FACTOR_A)])
+        b_full = b_desc.load([k * (BLOCK_K // DIV_FACTOR_B), 0])
 
-        # Scaled matrix multiply using tl.dot_scaled
-        accumulator = tl.dot_scaled(a, scale_a, DTYPE_A, b, scale_b, DTYPE_B, accumulator)
+        # Process K subtiles for better register pressure and ILP
+        for k_sub in tl.static_range(NUM_K_SUBTILES):
+            # Calculate subtile indices
+            k_start = k_sub * SUBTILE_K
+            k_end = k_start + SUBTILE_K
+            k_scale_start = k_sub * SUBTILE_K_SCALE
+            k_scale_end = k_scale_start + SUBTILE_K_SCALE
+
+            # Slice K dimension for data
+            # Handle FP4 packing: need to adjust indices by DIV_FACTOR
+            if DIV_FACTOR_A == 1:
+                a_sub = a_full[:, k_start:k_end]
+            else:
+                # FP4: 2 elements per byte
+                a_sub = a_full[:, (k_start // DIV_FACTOR_A):(k_end // DIV_FACTOR_A)]
+
+            if DIV_FACTOR_B == 1:
+                b_sub = b_full[k_start:k_end, :]
+            else:
+                # FP4: 2 elements per byte
+                b_sub = b_full[(k_start // DIV_FACTOR_B):(k_end // DIV_FACTOR_B), :]
+
+            # Slice K dimension for scales
+            scale_a_sub = scale_a_full[:, k_scale_start:k_scale_end]
+            scale_b_sub = scale_b_full[:, k_scale_start:k_scale_end]
+
+            # Scaled matrix multiply using tl.dot_scaled with K subtile
+            accumulator = tl.dot_scaled(a_sub, scale_a_sub, DTYPE_A,
+                                       b_sub, scale_b_sub, DTYPE_B, accumulator)
 
     # =========================================================================
     # Store output
@@ -262,11 +299,14 @@ def run_mxfp_gemm(
     dtype_b: str,
     num_warps: int,
     group_size_m: int,
+    num_stages: int = None,  # NEW: auto-tune if None
+    num_k_subtiles: int = None,  # NEW: auto-tune if None
 ):
     """
     Run MXFP GEMM kernel with specified configuration.
 
     Uses descriptor loads for both matrices and scales, with pre-shuffled scale layout.
+    Enhanced with automatic tuning for num_stages and K-dimension subtiling.
 
     Args:
         M, N, K: Matrix dimensions
@@ -274,6 +314,8 @@ def run_mxfp_gemm(
         dtype_a, dtype_b: Data types for A and B ('float4', 'float8_e5m2', 'float8_e4m3')
         num_warps: Number of warps per block
         group_size_m: Number of programs per group for L2 cache efficiency
+        num_stages: Number of pipeline stages (2, 3, or 4). Auto-tuned if None.
+        num_k_subtiles: K-dimension subtiling factor (1, 2, or 4). Auto-tuned if None.
 
     Returns:
         Tuple of (output_tensor, reference_tensor, max_diff)
@@ -312,6 +354,25 @@ def run_mxfp_gemm(
     b_scale_d = b_scale_input.cuda()
     c_d = torch.zeros(M, N, dtype=torch.float32, device='cuda')
 
+    # Auto-tune num_stages if not specified
+    if num_stages is None:
+        num_k_tiles = (K + BLOCK_K - 1) // BLOCK_K
+        if num_k_tiles >= 8:
+            num_stages = 4  # Deep pipeline for very large K
+        elif num_k_tiles >= 4:
+            num_stages = 3  # 3-stage for medium-large K
+        else:
+            num_stages = 2  # Default for small K
+
+    # Auto-tune num_k_subtiles if not specified
+    if num_k_subtiles is None:
+        if K >= 1024:
+            num_k_subtiles = 4  # Aggressive subtiling for very large K
+        elif K >= 512:
+            num_k_subtiles = 2  # 2-way split for large K
+        else:
+            num_k_subtiles = 1  # No subtiling for small K
+
     # Launch kernel
     num_blocks = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
     grid = (num_blocks, )
@@ -329,7 +390,9 @@ def run_mxfp_gemm(
         SCALE_BLOCK,  #
         BLOCK_M, BLOCK_N, BLOCK_K,  #
         group_size_m,  #
+        num_k_subtiles,  # NEW: K-subtiling parameter
         num_warps=num_warps,  #
+        num_stages=num_stages,  # NEW: Pipeline stages parameter
     )
 
     torch.cuda.synchronize()
@@ -363,8 +426,28 @@ def test_mxgemm(M, N, K, BM, BN, BK, dtype_a, dtype_b):
     torch.testing.assert_close(output, ref, rtol=1e-5, atol=0.02)
 
 
+@pytest.mark.parametrize("M, N, K", [(2048, 2048, 1024), (4096, 4096, 1024)])
+@pytest.mark.parametrize("BM, BN, BK", [(128, 128, 256)])
+@pytest.mark.parametrize("dtype_a, dtype_b", [('float8_e5m2', 'float8_e5m2'), ('float8_e4m3', 'float8_e4m3')])
+@pytest.mark.parametrize("num_k_subtiles", [1, 2])
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Scaled dot with TDM is only tested on gfx1250.")
+def test_mxgemm_large_k_subtiling(M, N, K, BM, BN, BK, dtype_a, dtype_b, num_k_subtiles):
+    """Test MXFP GEMM with K-subtiling for large problem sizes."""
+
+    output, ref, max_diff = run_mxfp_gemm(M, N, K,  #
+                                          BM, BN, BK,  #
+                                          dtype_a, dtype_b,  #
+                                          num_warps=8,  # Use 8 warps for large problems
+                                          group_size_m=8,  # Better L2 locality
+                                          num_stages=3,  # 3-stage pipeline
+                                          num_k_subtiles=num_k_subtiles)
+
+    # Looser tolerance for large problems due to accumulated FP8 errors
+    torch.testing.assert_close(output, ref, rtol=1e-4, atol=0.05)
+
+
 def main():
-    parser = argparse.ArgumentParser(description='MXFP GEMM Kernel')
+    parser = argparse.ArgumentParser(description='MXFP GEMM Kernel with K-Subtiling and Software Pipelining')
 
     parser.add_argument('-M', type=int, default=1024, help='M dimension')
     parser.add_argument('-N', type=int, default=1024, help='N dimension')
@@ -376,19 +459,25 @@ def main():
     parser.add_argument('--dtype_b', type=str, default='float8_e5m2', choices=['float4', 'float8_e5m2', 'float8_e4m3'])
     parser.add_argument('--num_warps', type=int, default=4, help='Number of warps')
     parser.add_argument('--group_size_m', type=int, default=1, help='Number of programs per group')
+    parser.add_argument('--num_stages', type=int, default=None, help='Pipeline stages (2-4, auto if not set)')
+    parser.add_argument('--num_k_subtiles', type=int, default=None, help='K-dimension subtiles (1,2,4, auto if not set)')
 
     args = parser.parse_args()
 
     print(f"Running MXFP GEMM: {args.dtype_a} x {args.dtype_b}")
     print(f"  Dimensions: M={args.M}, N={args.N}, K={args.K}")
     print(f"  Block sizes: block_m={args.block_m}, block_n={args.block_n}, block_k={args.block_k}")
-    print("  Mode: Descriptor loads with pre-shuffled scales")
+    print(f"  Num warps: {args.num_warps}, Group size M: {args.group_size_m}")
+    print(f"  Num stages: {args.num_stages or 'auto'}, K subtiles: {args.num_k_subtiles or 'auto'}")
+    print("  Mode: Descriptor loads with pre-shuffled scales + K-subtiling")
 
     output, ref, max_diff = run_mxfp_gemm(args.M, args.N, args.K,  #
                                           args.block_m, args.block_n, args.block_k,  #
                                           args.dtype_a, args.dtype_b,  #
                                           num_warps=args.num_warps,  #
                                           group_size_m=args.group_size_m,  #
+                                          num_stages=args.num_stages,  # NEW
+                                          num_k_subtiles=args.num_k_subtiles,  # NEW
                                           )
 
     print("\nResults:")
