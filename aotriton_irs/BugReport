@@ -1,0 +1,37 @@
+** Original issue: https://github.com/AMD-Triton/triton-tickets/issues/1834
+
+** Bug summary:
+The original IR contains a convert-layout between two amd mfma layouts that
+are equivalent. During convert layout lowering, Triton replaces the op with 
+adaptor.getSrc() which is a dot result. MLIR's replaceOp() generates an 
+unrealized cast from tensor -> tensor, which cannot be reconciled later. 
+This unresolved cast is passed through to the MLIR-to-LLVM translator, causing
+the translation failure.
+
+It's not entirely clear to me how MLIR generates that particular unrealized
+cast. We may fix it at the replaceOp() level: Instead of generating an unrealized
+cast of tensor -> tensor, generate an unrealized cast of llvm struct -> tensor,
+which can be properly reconciled during translation. Or, should we adjust what 
+is passed to replaceOp() to avoid unresolvable casts?
+
+** Artifacts
+before_translate.mlir : The MLIR output that caused failure during LLVM IR translation. 
+                        The unresolvable unrealized casts are at lines 1196 - 1198.
+
+  Reproduction command:
+
+  mlir-translate --mlir-to-llvmir -allow-unregistered-dialect ./before_translate.mlir -o ./out.ll
+
+
+convertToLLVMIR.mlir : The Triton-generated IR captured immediately before the convertLayoutToLLVM pass.
+
+  Line 669: The convert_layout op that produced unresolvable unrealized casts after lowering.
+  Line 967: A similar convert_layout op that was rewritten to a pair of unrealized casts, 
+            and was successfully reconciled.
+
+  Command:
+  triton-opt --convert-triton-amdgpu-to-llvm=arch=gfx950 ./convertToLLVMIR.mlir
+  (with --debug-only=dialect-conversion and/or --debug-only=ttgpu_to_llvm)
+
+convertToLLVMIR.dump : The Triton IR dumped by the convertLayoutToLLVM pass. The problematic 
+                       unrealized casts are at lines 6951 - 6954.
